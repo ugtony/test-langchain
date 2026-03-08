@@ -24,50 +24,46 @@ app.add_middleware(
 )
 
 # ==========================================
-# 1. 狀態定義 (子圖也必須繼承 messages)
+# 1. 狀態定義 (Data 與 Messages 徹底分離)
 # ==========================================
 class SubState(TypedDict):
-    terms: List[str]
-    # 🌟 讓子圖也能讀寫對話紀錄，這樣才能記錄工程師的提問與 AI 的回答
+    terms: List[str]  # 🌟 這裡放生資料 (JSON/Array)
     messages: Annotated[list[BaseMessage], add_messages]
 
 class MainState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
-    terms: List[str]
+    terms: List[str]  # 🌟 主圖也會共享這個狀態
 
 # ==========================================
-# 2. 建立子圖 (回到起點的迴圈設計)
+# 2. 建立子圖 (負責抓取與審核數據)
 # ==========================================
 async def research_node(state: SubState, writer: StreamWriter):
-    # 🌟 動態抓取對話紀錄的最後一句話，確認目前要分析的目標
-    messages = state.get("messages", [])
-    current_query = messages[-1].content if messages else "未知指令"
+    # 從最後一句對話判斷意圖
+    last_msg = state["messages"][-1].content if state["messages"] else "預設分析"
+    writer({"node": "research_node", "msg": f"正在執行「{last_msg}」的機台掃描..."})
     
-    # 根據最新的提問重新啟動掃描
-    writer({"node": "research_node", "msg": f"收到指示「{current_query}」，正在重新掃描機台感測器與歷史紀錄..."})
     await asyncio.sleep(1.0) 
-    
-    # 實務上這裡會呼叫 RAG 或 LLM 根據 current_query 產出不同的 terms
+    # 只更新數據，不發送 Message
     return {"terms": ["Gas Flow", "RF Power", "Pressure"]}
 
 async def human_review_node(state: SubState, writer: StreamWriter):
-    writer({"node": "human_review_node", "msg": f"抓取到預設參數：{state.get('terms')}，準備暫停等待確認..."})
+    writer({"node": "human_review_node", "msg": f"偵測到參數：{state['terms']}，等待工程師放行..."})
     
-    human_feedback = interrupt("請確認參數 (輸入 JSON)，或直接輸入新指示讓系統重新分析：")
+    # 觸發中斷，等待人類輸入
+    human_feedback = interrupt("請確認參數 (JSON) 或輸入新指令：")
     
-    # 1. 嘗試解析是否為合格的參數 (JSON Array)
+    # 🌟 嘗試解析：如果是工程師確認後的參數
     try:
         parsed = json.loads(human_feedback) if isinstance(human_feedback, str) else human_feedback
         if isinstance(parsed, list):
-            writer({"node": "human_review_node", "msg": f"✅ 收到有效參數：{parsed}，審核通過。"})
+            writer({"node": "human_review_node", "msg": "✅ 審核通過，參數已鎖定至系統狀態。"})
+            # 🌟 只更新 terms，Message 保持乾淨，不渲染 JSON 到前端
             return {"terms": parsed}
     except Exception:
-        pass # 解析失敗，不報錯，繼續往下走
+        pass 
 
-    # 🌟 2. 解析失敗 -> 當作全新問題，跳回起點！
-    writer({"node": "human_review_node", "msg": f"偵測到新問題，系統將回到起點重新啟動分析流程..."})
-    
-    # 使用 Command 把新問題加入對話，並強制跳回 "research" 節點
+    # 🌟 如果不是 JSON：視為新指令，跳回起點重新分析
+    writer({"node": "human_review_node", "msg": "偵測到新指令，正在重置流程..."})
     return Command(
         goto="research",
         update={"messages": [HumanMessage(content=str(human_feedback))]}
@@ -76,28 +72,34 @@ async def human_review_node(state: SubState, writer: StreamWriter):
 sub_builder = StateGraph(SubState)
 sub_builder.add_node("research", research_node)
 sub_builder.add_node("review", human_review_node)
-
 sub_builder.add_edge(START, "research")
 sub_builder.add_edge("research", "review")
-# 如果 review 成功解析參數，走預設路徑結束子圖，回到主圖的 llm 節點
-sub_builder.add_edge("review", END) 
+sub_builder.add_edge("review", END)
 sub_graph = sub_builder.compile()
 
 # ==========================================
-# 3. 建立主圖
+# 3. 建立主圖 (LLM 節點負責「翻譯」數據)
 # ==========================================
 async def mock_llm_node(state: MainState, writer: StreamWriter):
-    writer({"node": "llm_node", "msg": "正在綜合評估蝕刻深度與參數關聯..."})
+    writer({"node": "llm_node", "msg": "正在彙整審核數據並生成最終報告..."})
     await asyncio.sleep(1.0)
     
-    terms = state.get("terms", [])
-    mock_reply = f"分析完成。建議針對 {', '.join(terms)} 進行 Recipe 微調，以確保良率。"
-    return {"messages": [AIMessage(content=mock_reply)]}
+    # 🌟 核心邏輯：LLM 從 state['terms'] 讀取生資料，而非從對話紀錄
+    current_data = state.get("terms", [])
+    data_str = ", ".join(current_data) if current_data else "無可用數據"
+
+    # 模擬 LLM 根據數據生成的自然語言回覆
+    # 在真實場景，這裡會把 data_str 放入 Prompt Template 餵給 OpenAI/Claude
+    report_content = (
+        f"分析報告完成。根據工程師剛才審核通過的參數（{data_str}），"
+        "目前機台穩定性評估為：優。建議可按照此 Recipe 繼續執行蝕刻任務。"
+    )
+    
+    return {"messages": [AIMessage(content=report_content)]}
 
 workflow = StateGraph(MainState)
 workflow.add_node("clarify", sub_graph) 
 workflow.add_node("llm", mock_llm_node)
-
 workflow.add_edge(START, "clarify")
 workflow.add_edge("clarify", "llm")
 workflow.add_edge("llm", END)
@@ -105,6 +107,9 @@ workflow.add_edge("llm", END)
 memory = MemorySaver()
 graph_app = workflow.compile(checkpointer=memory)
 
+# ==========================================
+# 4. API 路由與安全 JSON 編碼 (不變)
+# ==========================================
 def safe_json_encoder(obj):
     if isinstance(obj, BaseMessage):
         return {"type": obj.type, "content": obj.content}
@@ -113,9 +118,6 @@ def safe_json_encoder(obj):
     except Exception:
         return "[Unserializable]"
 
-# ==========================================
-# 4. API 路由 (支援 resume 指令)
-# ==========================================
 @app.post("/chat")
 async def chat(data: dict):
     user_input = data.get("input", "")
@@ -125,34 +127,18 @@ async def chat(data: dict):
 
     async def event_generator():
         try:
-            # 判斷是全新對話還是接續中斷
-            if resume_data is not None:
-                payload = Command(resume=resume_data)
-            else:
-                payload = {"messages": [HumanMessage(content=user_input)]}
-
+            payload = Command(resume=resume_data) if resume_data is not None else {"messages": [HumanMessage(content=user_input)]}
             async for namespace, mode, chunk in graph_app.astream(
-                payload,
-                config,
-                stream_mode=["updates", "custom", "messages"],
-                subgraphs=True
+                payload, config, stream_mode=["updates", "custom", "messages"], subgraphs=True
             ):
                 if mode == "messages":
                     msg_chunk, _ = chunk
                     chunk_data = {"type": msg_chunk.type, "content": msg_chunk.content}
                 else:
                     chunk_data = chunk
-
-                payload_data = {
-                    "namespace": namespace,
-                    "mode": mode,
-                    "chunk": chunk_data
-                }
-                yield f"data: {json.dumps(payload_data, ensure_ascii=False, default=safe_json_encoder)}\n\n"
-                
+                yield f"data: {json.dumps({'namespace': namespace, 'mode': mode, 'chunk': chunk_data}, ensure_ascii=False, default=safe_json_encoder)}\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'mode': 'error', 'msg': str(e)}, ensure_ascii=False)}\n\n"
-
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 # ==========================================
