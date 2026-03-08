@@ -1,59 +1,68 @@
 import asyncio
 import json
 import httpx
+import uuid
 
-async def run_client():
-    url = "http://localhost:8000/chat"
-    payload = {
-        "input": "請協助分析最新蝕刻製程的 Recipe 參數"
-    }
-
-    print(f"🚀 發送請求至 {url}...\n")
-    print("-" * 50)
-
-    # 建立非同步 HTTP 客戶端
+async def stream_request(url: str, payload: dict):
+    """將串流請求封裝成可重複使用的函數"""
     async with httpx.AsyncClient() as client:
-        # 使用 POST 發送請求，並開啟 stream 模式接收 SSE
-        # timeout=None 確保長時間運算的圖不會中途斷線
         async with client.stream("POST", url, json=payload, timeout=None) as response:
-            
-            # 逐行讀取伺服器回傳的串流資料
             async for line in response.aiter_lines():
-                # 過濾掉空白行，只處理 SSE 標準的 "data: " 開頭
-                if not line.startswith("data: "):
-                    continue
-
-                # 移除 "data: " 前綴，提取純 JSON 字串
-                json_str = line[6:]
-                
+                if not line.startswith("data: "): continue
                 try:
-                    data = json.loads(json_str)
+                    data = json.loads(line[6:])
                 except json.JSONDecodeError:
-                    print(f"⚠️ 解析失敗的字串: {json_str}")
                     continue
 
                 mode = data.get("mode")
                 chunk = data.get("chunk")
-                
-                # 將 namespace 陣列轉為可讀的字串，例如 "clarify/research"
-                namespace = data.get("namespace", [])
-                ns_str = "/".join(namespace) if namespace else "root"
+                ns_str = "/".join(data.get("namespace", [])) or "root"
 
-                # 根據不同模式，印出不同格式的 Log
                 if mode == "error":
                     print(f"❌ [系統錯誤] {data.get('msg')}")
                 elif mode == "custom":
                     print(f"⏳ [{ns_str} - 進度] {chunk.get('msg')}")
                 elif mode == "updates":
-                    # 將 dict 轉回字串印出，方便閱讀
-                    chunk_str = json.dumps(chunk, ensure_ascii=False)
-                    print(f"🔄 [{ns_str} - 狀態更新] {chunk_str}")
+                    # 當圖被 interrupt 時，updates 模式會吐出特殊的 __interrupt__ 標記
+                    if "__interrupt__" in chunk:
+                        print(f"✋ [{ns_str} - 觸發中斷] 系統已凍結，等待人類指令...")
+                    else:
+                        print(f"🔄 [{ns_str} - 狀態更新] {json.dumps(chunk, ensure_ascii=False)}")
                 elif mode == "messages":
                     print(f"💬 [{ns_str} - 對話] {chunk.get('type')}: {chunk.get('content')}")
 
-    print("-" * 50)
-    print("✅ 串流接收完畢！")
+async def run_client():
+    url = "http://localhost:8000/chat"
+    
+    # 🌟 關鍵：必須記住這個 thread_id，才能接續中斷的對話
+    session_thread_id = str(uuid.uuid4())
+
+    print("=========================================")
+    print("🚀 第一階段：啟動分析 (預期會在審核節點停下)")
+    print("=========================================")
+    payload_1 = {
+        "input": "請協助分析最新蝕刻製程的 Recipe 參數",
+        "thread_id": session_thread_id
+    }
+    await stream_request(url, payload_1)
+
+    print("\n=========================================")
+    print("👨‍💻 人類工程師介入中...")
+    print("（假設工程師將 Gas Flow 剔除，並加入了 Temperature）")
+    await asyncio.sleep(2) # 模擬思考時間
+    print("=========================================\n")
+
+    print("=========================================")
+    print("🚀 第二階段：傳送修改後的參數，喚醒圖形繼續執行")
+    print("=========================================")
+    # 🌟 關鍵：帶入 resume 欄位，並且 thread_id 要跟剛剛一樣
+    payload_2 = {
+        "resume": ["Temperature", "RF Power", "Pressure"], 
+        "thread_id": session_thread_id
+    }
+    await stream_request(url, payload_2)
+    
+    print("\n✅ 整個流程順利走完！")
 
 if __name__ == "__main__":
-    # 執行非同步主程式
     asyncio.run(run_client())
