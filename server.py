@@ -24,39 +24,63 @@ app.add_middleware(
 )
 
 # ==========================================
-# 1. 狀態定義
+# 1. 狀態定義 (子圖也必須繼承 messages)
 # ==========================================
 class SubState(TypedDict):
     terms: List[str]
+    # 🌟 讓子圖也能讀寫對話紀錄，這樣才能記錄工程師的提問與 AI 的回答
+    messages: Annotated[list[BaseMessage], add_messages]
 
 class MainState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
     terms: List[str]
 
 # ==========================================
-# 2. 建立子圖 (加入人類審核節點)
+# 2. 建立子圖 (回到起點的迴圈設計)
 # ==========================================
 async def research_node(state: SubState, writer: StreamWriter):
-    writer({"node": "research_node", "msg": "正在掃描機台感測器與歷史 Recipe 紀錄..."})
+    # 🌟 動態抓取對話紀錄的最後一句話，確認目前要分析的目標
+    messages = state.get("messages", [])
+    current_query = messages[-1].content if messages else "未知指令"
+    
+    # 根據最新的提問重新啟動掃描
+    writer({"node": "research_node", "msg": f"收到指示「{current_query}」，正在重新掃描機台感測器與歷史紀錄..."})
     await asyncio.sleep(1.0) 
+    
+    # 實務上這裡會呼叫 RAG 或 LLM 根據 current_query 產出不同的 terms
     return {"terms": ["Gas Flow", "RF Power", "Pressure"]}
 
 async def human_review_node(state: SubState, writer: StreamWriter):
-    writer({"node": "human_review_node", "msg": f"抓取到預設參數：{state['terms']}，準備暫停等待確認..."})
+    writer({"node": "human_review_node", "msg": f"抓取到預設參數：{state.get('terms')}，準備暫停等待確認..."})
     
-    # 觸發中斷！執行緒在此凍結
-    human_feedback = interrupt("請確認是否同意使用這些參數，或提供修改後的參數陣列")
+    human_feedback = interrupt("請確認參數 (輸入 JSON)，或直接輸入新指示讓系統重新分析：")
     
-    # 收到 resume 指令後從這裡甦醒
-    writer({"node": "human_review_node", "msg": f"收到工程師回覆，最終採用參數：{human_feedback}"})
-    return {"terms": human_feedback}
+    # 1. 嘗試解析是否為合格的參數 (JSON Array)
+    try:
+        parsed = json.loads(human_feedback) if isinstance(human_feedback, str) else human_feedback
+        if isinstance(parsed, list):
+            writer({"node": "human_review_node", "msg": f"✅ 收到有效參數：{parsed}，審核通過。"})
+            return {"terms": parsed}
+    except Exception:
+        pass # 解析失敗，不報錯，繼續往下走
+
+    # 🌟 2. 解析失敗 -> 當作全新問題，跳回起點！
+    writer({"node": "human_review_node", "msg": f"偵測到新問題，系統將回到起點重新啟動分析流程..."})
+    
+    # 使用 Command 把新問題加入對話，並強制跳回 "research" 節點
+    return Command(
+        goto="research",
+        update={"messages": [HumanMessage(content=str(human_feedback))]}
+    )
 
 sub_builder = StateGraph(SubState)
 sub_builder.add_node("research", research_node)
 sub_builder.add_node("review", human_review_node)
+
 sub_builder.add_edge(START, "research")
 sub_builder.add_edge("research", "review")
-sub_builder.add_edge("review", END)
+# 如果 review 成功解析參數，走預設路徑結束子圖，回到主圖的 llm 節點
+sub_builder.add_edge("review", END) 
 sub_graph = sub_builder.compile()
 
 # ==========================================
@@ -166,9 +190,9 @@ async def get_test_page():
         
         <div class="box" id="interruptArea">
             <h3 class="interrupt-title">⚠️ 系統已暫停：等待工程師審核參數</h3>
-            <p style="color: #666; font-size: 14px;">請修改下方陣列 (JSON 格式)，並點擊繼續執行：</p>
+            <p style="color: #666; font-size: 14px;">請修改下方陣列 (JSON 格式)，<b>或直接輸入新指令讓系統重新分析 (例如: 改幫我查前天機台當機時的歷史紀錄)</b>：</p>
             <input type="text" id="resumeInput" value='["Temperature", "RF Power", "Pressure"]' />
-            <button class="btn-success" onclick="resumeStream()">確認並繼續執行</button>
+            <button class="btn-success" onclick="resumeStream()">送出</button>
         </div>
         
         <div class="box"><h3>Custom 模式 (進度事件)</h3><div id="customLog" class="log" style="color: #ffaa00;"></div></div>
@@ -255,28 +279,17 @@ async def get_test_page():
 
             // 發送中斷恢復請求 (Resume)
             async function resumeStream() {
-                // 隱藏審核控制台，恢復發送區
                 document.getElementById('interruptArea').style.display = 'none';
                 document.getElementById('actionArea').style.display = 'block';
                 
-                // 取得工程師修改的參數 (將字串轉回 JSON Array)
+                // 🌟 直接取得原始字串，不再用 JSON.parse() 強制檢查！
                 const rawInput = document.getElementById('resumeInput').value;
-                let resumeData;
-                try {
-                    resumeData = JSON.parse(rawInput);
-                } catch (e) {
-                    alert("參數格式錯誤，請輸入有效的 JSON 陣列，例如: [\\"A\\", \\"B\\"]");
-                    document.getElementById('interruptArea').style.display = 'block';
-                    document.getElementById('actionArea').style.display = 'none';
-                    return;
-                }
 
-                // 在 Log 中印出人類介入的提示
-                document.getElementById('updatesLog').innerHTML += `<span style="color: #28a745; font-weight: bold;">[前端] 👨‍💻 傳送審核結果：${rawInput}</span><br>`;
+                document.getElementById('updatesLog').innerHTML += `<span style="color: #28a745; font-weight: bold;">[前端] 👨‍💻 傳送審核結果或提問：${rawInput}</span><br>`;
 
-                // 帶著原來的 thread_id 發送 resume 指令
+                // 將原汁原味的字串傳給後端，讓後端的 try-except 去判斷
                 await processStream({
-                    resume: resumeData,
+                    resume: rawInput,
                     thread_id: currentThreadId
                 });
             }
